@@ -1,4 +1,5 @@
 /* STORYTELLER.VTG — back office app (Supabase) */
+window.STORYTELLER_APP_LOADED = true;
 (function () {
 "use strict";
 
