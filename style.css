@@ -224,3 +224,56 @@ tr.click{cursor:pointer} tr.click:hover td{background:var(--paper)}
 .loading-screen{min-height:60vh;display:grid;place-items:center;font-family:var(--type);color:var(--muted)}
 
 @media (prefers-reduced-motion:reduce){*{transition:none!important}.card:hover{transform:none}}
+
+/* ---------- layaway (ผ่อน) ---------- */
+.tabs button b.alert{background:var(--loss)!important;color:#fff!important}
+.stamp.lay{background:var(--orange);color:#fff}
+.stamp.lay.late{background:var(--loss)}
+.kpi.warn{background:var(--loss-soft)}
+.kpi[data-go]{cursor:pointer}
+.bar{display:block;height:10px;border:2px solid var(--ink);border-radius:999px;background:var(--card);overflow:hidden}
+.bar i{display:block;height:100%;background:var(--orange);border-right:2px solid var(--ink)}
+.bar.big{height:16px;margin:10px 0 4px}
+.laybox{display:flex;flex-direction:column;gap:6px;text-align:left;background:#FFF1E6;border:2px solid var(--orange);border-radius:10px;padding:12px;box-shadow:3px 3px 0 var(--orange)}
+.laybox.late{background:var(--loss-soft);border-color:var(--loss);box-shadow:3px 3px 0 var(--loss)}
+.laybox .lb-h{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;font-family:var(--head);font-size:14px}
+.laybox .lb-f{font-size:13px}
+.laybox .lb-go{font-family:var(--head);font-size:13px;color:var(--orange-deep)}
+.lay-list{display:grid;gap:10px}
+.lay-row{display:grid;grid-template-columns:64px minmax(0,1fr) auto;gap:14px;align-items:center;text-align:left;background:var(--card);border:2px solid var(--ink);border-radius:12px;padding:10px 14px 10px 10px;box-shadow:var(--shadow)}
+.lay-row:hover{transform:translate(-1px,-1px);box-shadow:4px 4px 0 var(--ink)}
+.lay-row.late{border-color:var(--loss);box-shadow:3px 3px 0 var(--loss)}
+.lay-row.completed,.lay-row.cancelled{opacity:.75;box-shadow:none}
+.lr-ph{width:64px;height:80px;border:2px solid var(--ink);border-radius:8px;overflow:hidden;background:var(--paper-2);display:grid;place-items:center;color:var(--tweed);padding:0}
+.lr-ph img{width:100%;height:100%;object-fit:cover}
+.lr-ph.big{width:96px;height:120px;cursor:pointer}
+.lr-main{display:flex;flex-direction:column;gap:3px;min-width:0}
+.lr-top{font-family:var(--head)}
+.lr-shirt{font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lr-money{font-size:12.5px;color:var(--muted)}
+.lr-side{display:flex;flex-direction:column;align-items:flex-end;gap:2px;text-align:right}
+.lr-side .big{font-size:20px;font-weight:700}
+.lr-due{font-size:12.5px;color:var(--muted)}
+.lay-row.late .lr-due{color:var(--loss);font-weight:600}
+@media (max-width:560px){.lay-row{grid-template-columns:52px minmax(0,1fr)}.lr-ph{width:52px;height:66px}.lr-side{grid-column:1/-1;flex-direction:row;justify-content:space-between;align-items:baseline}}
+.st{display:inline-block;font-family:var(--type);font-weight:700;font-size:12px;padding:1px 9px;border:2px solid var(--ink);border-radius:4px;background:var(--mustard)}
+.st.active{background:var(--orange);color:#fff}
+.st.late{background:var(--loss);color:#fff}
+.st.completed{background:var(--gain-soft)}
+.st.cancelled{background:var(--paper-2)}
+.lay-head{display:flex;gap:16px;align-items:center}
+.lay-meta{display:flex;flex-direction:column;gap:4px;min-width:0}
+.lay-meta .name{margin:0;font-family:var(--head);font-size:20px;font-weight:600;line-height:1.3}
+.lay-sum{display:grid;grid-template-columns:repeat(3,1fr);border:2px solid var(--ink);border-radius:10px;background:var(--card);margin-top:16px;overflow:hidden}
+.lay-sum > div{padding:10px 12px;display:flex;flex-direction:column;border-right:1px dashed var(--line)}
+.lay-sum > div:last-child{border-right:0}
+.lay-sum .l{font-family:var(--head);font-size:12px;color:var(--muted)}
+.lay-sum .v{font-size:20px;font-weight:700}
+.lay-note{background:var(--card);border:1.5px dashed var(--ink);border-radius:8px;padding:8px 12px;margin:12px 0 0;white-space:pre-wrap;font-size:14px}
+.paybox{margin-top:16px;background:var(--card);border:2px solid var(--ink);border-radius:10px;padding:12px;display:grid;grid-template-columns:1.2fr 1fr 1fr auto;gap:10px;align-items:end}
+.paybox .linkbtn{grid-column:1/-1;justify-self:start}
+@media (max-width:620px){.paybox{grid-template-columns:1fr 1fr}.paybox .btn{grid-column:1/-1}}
+.sub-h{font-family:var(--head);font-size:15px;margin:20px 0 6px}
+.danger-link{color:var(--loss)}
+.dl-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.lay-meta .st{align-self:flex-start}

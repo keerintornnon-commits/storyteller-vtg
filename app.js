@@ -14,6 +14,8 @@ const today = () => { const d = new Date(); return d.getFullYear() + "-" + Strin
 const fmtDate = s => { if (!s) return "—"; const d = new Date(s + "T00:00:00"); return isNaN(d) ? s : d.toLocaleDateString("th-TH", { day: "numeric", month: "short", year: "2-digit" }); };
 const totalCost = s => n(s.cost) + n(s.extra_cost);
 const profitOf = s => s.sold ? n(s.sold_price) - totalCost(s) : null;
+const daysBetween = (a, b) => Math.round((new Date(b + "T00:00:00") - new Date(a + "T00:00:00")) / 864e5);
+const addDays = (d, k) => { const x = new Date(d + "T00:00:00"); x.setDate(x.getDate() + k); return x.getFullYear() + "-" + String(x.getMonth() + 1).padStart(2, "0") + "-" + String(x.getDate()).padStart(2, "0"); };
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
 
 let toastT;
@@ -26,7 +28,7 @@ const configured = CFG.SUPABASE_URL && !/YOUR-PROJECT-ID/.test(CFG.SUPABASE_URL)
 const sb = (configured && window.supabase) ? window.supabase.createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY) : (window.__MOCK_SB__ || null);
 
 // ---------- state ----------
-const state = { shirts: [], view: "dash", label: null, q: "", sort: "new", loaded: false, user: null };
+const state = { shirts: [], layaways: [], layReady: true, view: "dash", label: null, q: "", sort: "new", loaded: false, user: null };
 try { const v = localStorage.getItem("stvtg_view"); if (v) state.view = v; } catch (e) {}
 
 // =========================================================
@@ -114,14 +116,31 @@ async function loadShirts() {
     if (error) { toast("โหลดข้อมูลไม่สำเร็จ: " + error.message); break; }
     all.push(...data); if (data.length < page) break; from += page;
   }
-  state.shirts = all; state.loaded = true;
+  state.shirts = all;
+  await loadLayaways(false);
+  state.loaded = true;
   await render();
+}
+async function loadLayaways(draw = true) {
+  const { data, error } = await sb.from("layaways").select("*, layaway_payments(*)").order("created_at", { ascending: false });
+  if (error) { state.layReady = false; state.layaways = []; }
+  else {
+    state.layReady = true;
+    state.layaways = data.map(l => ({ ...l, payments: (l.layaway_payments || []).sort((a, b) => (a.paid_at || "").localeCompare(b.paid_at || "") || (a.created_at || "").localeCompare(b.created_at || "")) }));
+  }
+  if (draw) await render();
 }
 let channel = null, reloadT = null;
 function subscribe() {
   if (channel || !sb.channel) return;
   channel = sb.channel("shirts-live")
     .on("postgres_changes", { event: "*", schema: "public", table: "shirts" }, () => {
+      clearTimeout(reloadT); reloadT = setTimeout(loadShirts, 400);
+    })
+    .on("postgres_changes", { event: "*", schema: "public", table: "layaways" }, () => {
+      clearTimeout(reloadT); reloadT = setTimeout(loadShirts, 400);
+    })
+    .on("postgres_changes", { event: "*", schema: "public", table: "layaway_payments" }, () => {
       clearTimeout(reloadT); reloadT = setTimeout(loadShirts, 400);
     }).subscribe();
 }
@@ -212,10 +231,13 @@ function nextCode() {
 //  RENDER
 // =========================================================
 async function render() {
-  const all = state.shirts, stock = all.filter(s => !s.sold), sold = all.filter(s => s.sold);
+  const all = state.shirts, stock = all.filter(s => !s.sold && !activeLay(s.id)), sold = all.filter(s => s.sold);
   $("#cStock").textContent = stock.length; $("#cSold").textContent = sold.length; $("#cAll").textContent = all.length;
+  const actives = state.layaways.filter(l => l.status === "active");
+  $("#cLay").textContent = actives.length;
+  $("#cLay").classList.toggle("alert", actives.some(isOverdue));
   document.querySelectorAll("#tabs button").forEach(b => b.setAttribute("aria-selected", String(b.dataset.v === state.view)));
-  $("#toolbar").hidden = state.view === "dash";
+  $("#toolbar").hidden = state.view === "dash" || state.view === "lay";
 
   const labs = allLabels();
   $("#labelBar").innerHTML = labs.length ? `<button class="chip" data-l="" aria-pressed="${!state.label}">ทุกป้าย</button>` +
@@ -224,8 +246,9 @@ async function render() {
   const main = $("#main");
   if (!state.loaded) { main.innerHTML = `<div class="loading-screen">กำลังเปิดตู้เสื้อ…</div>`; return; }
   if (state.view === "dash") { main.innerHTML = dashHTML(); bindRows(main); return; }
+  if (state.view === "lay") { await renderLayaways(main); return; }
   let list = filtered();
-  if (state.view === "stock") list = list.filter(s => !s.sold);
+  if (state.view === "stock") list = list.filter(s => !s.sold && !activeLay(s.id));
   if (state.view === "sold") list = list.filter(s => s.sold);
   if (!list.length) {
     main.innerHTML = `<p class="empty">${all.length ? "ไม่พบเสื้อที่ตรงกับตัวกรอง" : "ตู้ยังว่างอยู่ กด “+ เพิ่มเสื้อ” เพื่อลงตัวแรก"}</p>`; return;
@@ -246,7 +269,7 @@ function cardHTML(s) {
   const img = first && photoUrl(first) ? `<img src="${esc(photoUrl(first))}" alt="" loading="lazy">` : `<div class="none">${SHIRT_SVG}</div>`;
   return `<button class="card" type="button" data-id="${esc(s.id)}">
     <div class="ph">${img}
-      <span class="stamp ${s.sold ? "sold" : ""}">${s.sold ? "SOLD" : "IN STOCK"}</span>
+      ${(() => { const l = activeLay(s.id); return s.sold ? `<span class="stamp sold">SOLD</span>` : l ? `<span class="stamp lay ${isOverdue(l) ? "late" : ""}">ผ่อนอยู่</span>` : `<span class="stamp">IN STOCK</span>`; })()}
       ${has(s.condition) ? `<span class="cond">${esc(s.condition)}</span>` : ""}
     </div>
     <div class="body">
@@ -255,7 +278,7 @@ function cardHTML(s) {
       <span class="size">${sizeText(s)}${s.fit ? " · " + esc(s.fit) : ""}</span>
       <div class="money">
         <span>ทุน <span class="num">${baht(totalCost(s))}</span></span>
-        ${s.sold ? `<span class="pill ${p >= 0 ? "gain" : "loss"}">${signed(p)}</span>` : (has(s.ask_price) ? `<span class="num">ตั้ง ${baht(n(s.ask_price))}</span>` : "")}
+        ${s.sold ? `<span class="pill ${p >= 0 ? "gain" : "loss"}">${signed(p)}</span>` : activeLay(s.id) ? `<span class="num">ค้าง ${baht(remainOf(activeLay(s.id)))}</span>` : (has(s.ask_price) ? `<span class="num">ตั้ง ${baht(n(s.ask_price))}</span>` : "")}
       </div>
     </div>
   </button>`;
@@ -265,7 +288,11 @@ function cardHTML(s) {
 function dashHTML() {
   let list = state.shirts;
   if (state.label) list = list.filter(s => (s.labels || []).includes(state.label));
-  const sold = list.filter(s => s.sold), stock = list.filter(s => !s.sold);
+  const sold = list.filter(s => s.sold), stock = list.filter(s => !s.sold && !activeLay(s.id));
+  const listIds = new Set(list.map(s => s.id));
+  const actLays = state.layaways.filter(l => l.status === "active" && listIds.has(l.shirt_id));
+  const layRemain = actLays.reduce((a, l) => a + remainOf(l), 0), layPaid = actLays.reduce((a, l) => a + paidOf(l), 0);
+  const layLate = actLays.filter(isOverdue).length;
   const revenue = sold.reduce((a, s) => a + n(s.sold_price), 0);
   const soldCost = sold.reduce((a, s) => a + totalCost(s), 0);
   const profit = revenue - soldCost;
@@ -293,6 +320,7 @@ function dashHTML() {
     <div class="kpi"><span class="l">ยอดขายรวม</span><span class="v">${baht(revenue)}</span><span class="s">มาร์จิ้น ${margin.toFixed(1)}%</span></div>
     <div class="kpi"><span class="l">ทุนของตัวที่ขายแล้ว</span><span class="v">${baht(soldCost)}</span><span class="s">รวมค่าซัก/ค่าส่ง</span></div>
     <div class="kpi"><span class="l">ทุนจมในสต็อก</span><span class="v">${baht(stockCost)}</span><span class="s">${stock.length} ตัว · ตั้งขายรวม ${baht(stockAsk)}</span></div>
+    ${state.layReady ? `<div class="kpi ${layLate ? "warn" : ""}" data-go="lay" role="button" tabindex="0"><span class="l">ผ่อนค้างรับ</span><span class="v">${baht(layRemain)}</span><span class="s">${actLays.length} ราย · รับแล้ว ${baht(layPaid)}${layLate ? ` · <b>เกินกำหนด ${layLate} ราย</b>` : ""}</span></div>` : ""}
     <div class="kpi"><span class="l">ลงทุนทั้งหมด</span><span class="v">${baht(invested)}</span><span class="s">${list.length} ตัวที่เคยซื้อ</span></div>
   </div>
   <div class="dash-grid">
@@ -313,6 +341,7 @@ function dashHTML() {
     </tbody></table></div>` : `<p class="empty">ไม่มีเสื้อค้างสต็อก</p>`}</div>`;
 }
 function bindRows(root) {
+  root.querySelectorAll("[data-go]").forEach(k => { const go = () => { state.view = k.dataset.go; render(); }; k.onclick = go; k.onkeydown = e => { if (e.key === "Enter") go(); }; });
   root.querySelectorAll("tr.click").forEach(r => { r.onclick = () => openDetail(r.dataset.id); r.onkeydown = e => { if (e.key === "Enter") openDetail(r.dataset.id); }; });
 }
 function chartSVG(sold) {
@@ -374,6 +403,7 @@ async function openDetail(id) {
       <div class="gal">
         <div class="main">${photos.length ? `<img id="gmain" src="${esc(photoUrl(photos[0]))}" alt="${esc(s.name)}">` : `<div class="ph" style="height:100%;border:0"><div class="none">${SHIRT_SVG}</div></div>`}</div>
         ${photos.length > 1 ? `<div class="thumbs">${photos.map((ph, i) => `<button type="button" data-i="${i}" aria-current="${i === 0}"><img src="${esc(photoUrl(ph))}" alt="รูปที่ ${i + 1}"></button>`).join("")}</div>` : ""}
+        ${photos.length ? `<div class="dl-row"><button class="btn small" type="button" id="dlOne">⤓ โหลดรูปนี้</button>${photos.length > 1 ? `<button class="btn small" type="button" id="dlAll">⤓ โหลดทุกรูป (${photos.length})</button>` : ""}</div>` : ""}
       </div>
       <div class="meta">
         <div>
@@ -400,11 +430,18 @@ async function openDetail(id) {
           <div class="full"><div class="l">${p >= 0 ? "กำไร" : "ขาดทุน"}</div><div class="v ${p >= 0 ? "gain" : "loss"}" style="font-size:22px">${signed(p)}</div></div>` : ""}
           ${s.note ? `<div class="full"><div class="l">หมายเหตุ</div><div style="white-space:pre-wrap">${esc(s.note)}</div></div>` : ""}
         </div>
-        ${!s.sold ? `<form class="sellbox" id="sellF">
+        ${(() => { const l = activeLay(s.id); if (!l) return ""; const pc = Math.min(100, paidOf(l) / Math.max(1, n(l.total_price)) * 100);
+          return `<button type="button" class="laybox ${isOverdue(l) ? "late" : ""}" id="openLay">
+            <span class="lb-h"><b>ผ่อนอยู่ · ${esc(l.customer_name)}</b><span>${dueText(l)}</span></span>
+            <span class="bar"><i style="width:${pc.toFixed(1)}%"></i></span>
+            <span class="lb-f num">จ่ายแล้ว ${baht(paidOf(l))} / ${baht(n(l.total_price))} · ค้าง ${baht(remainOf(l))}</span>
+            <span class="lb-go">เปิดรายการผ่อน →</span></button>`; })()}
+        ${!s.sold && !activeLay(s.id) ? `<form class="sellbox" id="sellF">
           <div class="field"><label for="sp">ขายได้ (฿)</label><input id="sp" type="number" inputmode="decimal" min="0" required value="${esc(s.ask_price ?? "")}"></div>
           <div class="field"><label for="sd">วันที่ขาย</label><input id="sd" type="date" required value="${today()}"></div>
           <button class="btn orange" type="submit">บันทึกว่าขายแล้ว</button>
-        </form>` : ""}
+        </form>
+        ${state.layReady ? `<button class="btn" type="button" id="startLay">เปิดผ่อนให้ลูกค้า</button>` : ""}` : ""}
         <div id="delZone"></div>
       </div>
     </div>
@@ -413,7 +450,13 @@ async function openDetail(id) {
       <button class="btn danger" type="button" id="delB">ลบ</button>
     </div>`);
   $("#mx", m).onclick = closeModal;
-  m.querySelectorAll(".thumbs button").forEach(b => b.onclick = () => { $("#gmain", m).src = photoUrl(photos[+b.dataset.i]); m.querySelectorAll(".thumbs button").forEach(x => x.setAttribute("aria-current", String(x === b))); });
+  let cur = 0;
+  m.querySelectorAll(".thumbs button").forEach(b => b.onclick = () => { cur = +b.dataset.i; $("#gmain", m).src = photoUrl(photos[cur]); m.querySelectorAll(".thumbs button").forEach(x => x.setAttribute("aria-current", String(x === b))); });
+  const d1 = $("#dlOne", m), dA = $("#dlAll", m);
+  if (d1) d1.onclick = () => downloadPhotos(s, [cur], d1);
+  if (dA) dA.onclick = () => downloadPhotos(s, photos.map((_, i) => i), dA);
+  const ol = $("#openLay", m); if (ol) ol.onclick = () => { const l = activeLay(s.id); closeModal(); openLayDetail(l.id); };
+  const sl = $("#startLay", m); if (sl) sl.onclick = () => { closeModal(); openLayForm(s); };
   $("#copyD", m).onclick = async () => {
     try { await navigator.clipboard.writeText(detailsText(s)); toast("คัดลอกแล้ว"); }
     catch (e) { const r = document.createRange(); r.selectNodeContents($(".hangtag", m)); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); toast("เลือกข้อความไว้แล้ว กด Ctrl/⌘+C"); }
@@ -434,6 +477,260 @@ async function openDetail(id) {
     $("#delZone", m).innerHTML = `<div class="confirm"><span>ลบ “${esc(s.name || s.code)}” และรูปทั้งหมดถาวร?</span><button class="btn small danger" type="button" id="delY">ลบเลย</button><button class="btn small" type="button" id="delN">ยกเลิก</button></div>`;
     $("#delN", m).onclick = () => { $("#delZone", m).innerHTML = ""; };
     $("#delY", m).onclick = async () => { try { await removeShirt(s); closeModal(); toast("ลบแล้ว"); } catch (err) { toast(dbErr(err)); } };
+  };
+}
+
+// =========================================================
+//  PHOTO DOWNLOAD
+// =========================================================
+const isTouch = () => matchMedia("(pointer: coarse)").matches;
+function saveBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a"); a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+let jszipP = null;
+function loadJSZip() {
+  if (window.JSZip) return Promise.resolve(window.JSZip);
+  return jszipP ||= new Promise((ok, bad) => { const sc = document.createElement("script"); sc.src = "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"; sc.onload = () => ok(window.JSZip); sc.onerror = bad; document.head.appendChild(sc); });
+}
+async function downloadPhotos(s, idxs, btn) {
+  const base = (s.code || s.name || "shirt").replace(/[\\/:*?"<>|\s]+/g, "-");
+  const label = btn.textContent; btn.disabled = true; btn.textContent = "กำลังโหลด…";
+  try {
+    const files = [];
+    for (const i of idxs) {
+      const path = s.photos[i];
+      const { data, error } = await sb.storage.from(BUCKET).download(path);
+      if (error || !data) throw error || new Error("download failed");
+      const ext = (path.split(".").pop() || "jpg").toLowerCase();
+      files.push(new File([data], `${base}-${i + 1}.${ext}`, { type: data.type || "image/jpeg" }));
+    }
+    // มือถือ: เปิดเมนูแชร์ ให้กด "บันทึกรูปภาพ" ลงคลังรูปได้ทันที
+    if (isTouch() && navigator.canShare && navigator.canShare({ files })) {
+      try { await navigator.share({ files }); return; } catch (e) { if (e && e.name === "AbortError") return; }
+    }
+    if (files.length === 1) { saveBlob(files[0], files[0].name); return; }
+    const JSZip = await loadJSZip();
+    const zip = new JSZip(); files.forEach(f => zip.file(f.name, f));
+    saveBlob(await zip.generateAsync({ type: "blob" }), `${base}-photos.zip`);
+  } catch (e) { toast("โหลดรูปไม่สำเร็จ ลองอีกครั้ง"); }
+  finally { btn.disabled = false; btn.textContent = label; }
+}
+
+// =========================================================
+//  LAYAWAY (ผ่อน)
+// =========================================================
+function activeLay(shirtId) { return state.layaways.find(l => l.shirt_id === shirtId && l.status === "active") || null; }
+function paidOf(l) { return (l.payments || []).reduce((a, p) => a + n(p.amount), 0); }
+function remainOf(l) { return Math.max(0, n(l.total_price) - paidOf(l)); }
+function isOverdue(l) { return l.status === "active" && l.due_date && l.due_date < today() && remainOf(l) > 0; }
+function dueText(l) {
+  if (!l.due_date) return "ไม่กำหนดวันครบ";
+  const d = daysBetween(today(), l.due_date);
+  if (l.status !== "active") return "ครบกำหนด " + fmtDate(l.due_date);
+  return d < 0 ? `เกินกำหนด ${-d} วัน` : d === 0 ? "ครบกำหนดวันนี้" : `เหลือ ${d} วัน (${fmtDate(l.due_date)})`;
+}
+const shirtOf = id => state.shirts.find(s => s.id === id);
+const STATUS_TH = { active: "กำลังผ่อน", completed: "ผ่อนครบ", cancelled: "ยกเลิก" };
+
+async function renderLayaways(main) {
+  if (!state.layReady) {
+    main.innerHTML = `<div class="panel"><h3>ยังไม่ได้เปิดระบบผ่อน</h3><p class="muted">ไปที่ Supabase › SQL Editor แล้วรันไฟล์ <b>supabase/update-02-layaway.sql</b> จากนั้นรีเฟรชหน้านี้</p></div>`; return;
+  }
+  const act = state.layaways.filter(l => l.status === "active").sort((a, b) => (a.due_date || "9").localeCompare(b.due_date || "9"));
+  const late = act.filter(isOverdue), ok = act.filter(l => !isOverdue(l));
+  const done = state.layaways.filter(l => l.status !== "active").slice(0, 20);
+  await ensureUrls(state.layaways.map(l => (shirtOf(l.shirt_id)?.photos || [])[0]).filter(Boolean));
+  const row = l => {
+    const s = shirtOf(l.shirt_id) || {}, ph = (s.photos || [])[0], pc = Math.min(100, paidOf(l) / Math.max(1, n(l.total_price)) * 100);
+    return `<button type="button" class="lay-row ${isOverdue(l) ? "late" : ""} ${l.status}" data-lay="${esc(l.id)}">
+      <span class="lr-ph">${ph && photoUrl(ph) ? `<img src="${esc(photoUrl(ph))}" alt="">` : SHIRT_SVG}</span>
+      <span class="lr-main">
+        <span class="lr-top"><b>${esc(l.customer_name)}</b>${l.customer_contact ? `<span class="muted"> · ${esc(l.customer_contact)}</span>` : ""}</span>
+        <span class="lr-shirt">${esc(s.code || "")} ${esc(s.name || "(ลบเสื้อแล้ว)")}</span>
+        <span class="bar"><i style="width:${pc.toFixed(1)}%"></i></span>
+        <span class="lr-money num">${baht(paidOf(l))} / ${baht(n(l.total_price))}</span>
+      </span>
+      <span class="lr-side">${l.status === "active" ? `<span class="num big">${baht(remainOf(l))}</span><span class="lr-due">${dueText(l)}</span>` : `<span class="st ${l.status}">${STATUS_TH[l.status]}</span><span class="lr-due">${fmtDate(l.completed_at || (l.updated_at || "").slice(0, 10))}</span>`}</span>
+    </button>`;
+  };
+  const totalRemain = act.reduce((a, l) => a + remainOf(l), 0);
+  main.innerHTML = `
+    <div class="kpis">
+      <div class="kpi hero"><span class="l">ยอดผ่อนค้างรับทั้งหมด</span><span class="v">${baht(totalRemain)}</span><span class="s">${act.length} รายการที่กำลังผ่อน</span></div>
+      <div class="kpi ${late.length ? "warn" : ""}"><span class="l">เกินกำหนด</span><span class="v">${late.length} ราย</span><span class="s">ค้าง ${baht(late.reduce((a, l) => a + remainOf(l), 0))}</span></div>
+      <div class="kpi"><span class="l">รับเงินผ่อนแล้ว</span><span class="v">${baht(act.reduce((a, l) => a + paidOf(l), 0))}</span><span class="s">จากรายการที่ยังเปิดอยู่</span></div>
+    </div>
+    ${late.length ? `<h2 class="section-h">Overdue <small>เกินกำหนด ต้องตาม</small></h2><div class="lay-list">${late.map(row).join("")}</div>` : ""}
+    <h2 class="section-h">On layaway <small>กำลังผ่อน · เรียงตามวันครบกำหนด</small></h2>
+    ${ok.length ? `<div class="lay-list">${ok.map(row).join("")}</div>` : `<p class="empty">ไม่มีรายการผ่อนที่เปิดอยู่ · เปิดผ่อนได้จากหน้ารายละเอียดเสื้อ</p>`}
+    ${done.length ? `<h2 class="section-h">History <small>ผ่อนครบ / ยกเลิก ล่าสุด</small></h2><div class="lay-list">${done.map(row).join("")}</div>` : ""}`;
+  main.querySelectorAll("[data-lay]").forEach(b => b.onclick = () => openLayDetail(b.dataset.lay));
+}
+
+// เปิดผ่อน / แก้ไขรายการผ่อน
+function openLayForm(s, existing) {
+  const l = existing || {};
+  const m = openModal(`
+    <form id="layF" novalidate>
+    <div class="modal-h"><h2>${existing ? "แก้ไขรายการผ่อน" : "เปิดผ่อน · " + esc(s.code || s.name)}</h2><button class="x" type="button" aria-label="ปิด" id="lx">×</button></div>
+    <div class="modal-b">
+      <p class="muted" style="margin-bottom:12px">${esc(s.name || "")}</p>
+      <div class="form">
+        <div class="field s4"><label for="lName">ชื่อลูกค้า</label><input id="lName" required value="${esc(l.customer_name || "")}"></div>
+        <div class="field s2"><label for="lContact">IG / LINE / เบอร์</label><input id="lContact" value="${esc(l.customer_contact || "")}"></div>
+        <div class="field s2"><label for="lTotal">ราคาเต็ม (฿)</label><input id="lTotal" type="number" min="0" inputmode="decimal" required value="${esc(l.total_price ?? s.ask_price ?? "")}"></div>
+        ${existing ? "" : `<div class="field s2"><label for="lDep">มัดจำ (฿)</label><input id="lDep" type="number" min="0" inputmode="decimal" required></div>
+        <div class="field s2"><label for="lDepM">จ่ายมัดจำด้วย</label><input id="lDepM" list="dlPay" placeholder="โอน / เงินสด"></div>`}
+        <div class="field s2"><label for="lStart">วันที่เริ่มผ่อน</label><input id="lStart" type="date" value="${esc(l.start_date || today())}"></div>
+        <div class="field s2"><label for="lDays">ระยะเวลาผ่อน</label>
+          <select id="lDays"><option value="">กำหนดวันเอง</option><option value="14">14 วัน</option><option value="30">30 วัน</option><option value="45">45 วัน</option><option value="60">60 วัน</option><option value="90">90 วัน</option></select></div>
+        <div class="field s2"><label for="lDue">ต้องจ่ายครบภายใน</label><input id="lDue" type="date" value="${esc(l.due_date || addDays(today(), 30))}"></div>
+        <div class="field s6"><label for="lNote">หมายเหตุ / เงื่อนไข</label><textarea id="lNote" placeholder="เช่น ถ้าไม่ครบตามกำหนด ขอยึดมัดจำ">${esc(l.note || "")}</textarea></div>
+      </div>
+      <datalist id="dlPay"><option value="โอน"><option value="เงินสด"><option value="TrueMoney"><option value="PromptPay"></datalist>
+    </div>
+    <div class="modal-f"><span class="hint" id="lMsg" style="align-self:center"></span><div style="display:flex;gap:8px"><button class="btn" type="button" id="lCancel">ยกเลิก</button><button class="btn orange" type="submit" id="lSave">${existing ? "บันทึก" : "เปิดผ่อน"}</button></div></div>
+    </form>`);
+  $("#lx", m).onclick = closeModal; $("#lCancel", m).onclick = closeModal;
+  if (!existing) $("#lDays", m).value = "30";
+  $("#lDays", m).onchange = () => { const d = +$("#lDays", m).value; if (d) $("#lDue", m).value = addDays($("#lStart", m).value || today(), d); };
+  $("#lStart", m).onchange = () => $("#lDays", m).onchange();
+  $("#lDue", m).oninput = () => { $("#lDays", m).value = ""; };
+  $("#layF", m).onsubmit = async e => {
+    e.preventDefault();
+    const msg = t => { $("#lMsg", m).textContent = t; };
+    const name = $("#lName", m).value.trim(), total = n($("#lTotal", m).value);
+    if (!name) return msg("ใส่ชื่อลูกค้า");
+    if (!(total > 0)) return msg("ใส่ราคาเต็ม");
+    const dep = existing ? 0 : n($("#lDep", m).value);
+    if (!existing && dep > total) return msg("มัดจำมากกว่าราคาเต็ม");
+    const data = { customer_name: name, customer_contact: $("#lContact", m).value.trim() || null, total_price: total,
+      start_date: $("#lStart", m).value || today(), due_date: $("#lDue", m).value || null, note: $("#lNote", m).value.trim() || null };
+    const btn = $("#lSave", m); btn.disabled = true; msg("กำลังบันทึก…");
+    try {
+      let id = existing && existing.id;
+      if (existing) { const { error } = await sb.from("layaways").update(data).eq("id", id); if (error) throw error; }
+      else {
+        const { data: row, error } = await sb.from("layaways").insert({ ...data, shirt_id: s.id }).select().single(); if (error) throw error;
+        id = row.id;
+        if (dep > 0) { const { error: e2 } = await sb.from("layaway_payments").insert({ layaway_id: id, kind: "deposit", amount: dep, paid_at: data.start_date, method: $("#lDepM", m).value.trim() || null }); if (e2) throw e2; }
+      }
+      await loadLayaways(false);
+      await completeIfPaid(id);
+      closeModal(); toast(existing ? "บันทึกแล้ว" : "เปิดผ่อนแล้ว");
+      await render(); openLayDetail(id);
+    } catch (err) { btn.disabled = false; msg(/one_active|duplicate/i.test(err.message || "") ? "เสื้อตัวนี้มีรายการผ่อนเปิดอยู่แล้ว" : dbErr(err)); }
+  };
+  setTimeout(() => $("#lName", m).focus(), 30);
+}
+
+// ผ่อนครบ → ปิดรายการ + เสื้อย้ายไป "ขายแล้ว" อัตโนมัติ
+async function completeIfPaid(id) {
+  const l = state.layaways.find(x => x.id === id);
+  if (!l || l.status !== "active" || remainOf(l) > 0) return false;
+  const last = (l.payments[l.payments.length - 1] || {}).paid_at || today();
+  const { error } = await sb.from("layaways").update({ status: "completed", completed_at: last }).eq("id", id); if (error) throw error;
+  await saveShirt(l.shirt_id, { sold: true, sold_price: n(l.total_price), sold_date: last, channel: "ผ่อน" });
+  await loadLayaways(false);
+  toast("ผ่อนครบแล้ว! ย้ายเสื้อไป “ขายแล้ว” ให้เรียบร้อย");
+  return true;
+}
+
+function laySummaryText(l) {
+  const s = shirtOf(l.shirt_id) || {};
+  const lines = [`สรุปยอดผ่อน · STORYTELLER.VTG`, `${s.code || ""} ${s.name || ""}`.trim(), `ราคาเต็ม ${baht(n(l.total_price))}`, ``];
+  l.payments.forEach((p, i) => lines.push(`${i + 1}. ${fmtDate(p.paid_at)} ${p.kind === "deposit" ? "มัดจำ" : "ชำระ"} ${baht(n(p.amount))}`));
+  lines.push(``, `จ่ายแล้ว ${baht(paidOf(l))}`, `คงเหลือ ${baht(remainOf(l))}`);
+  if (l.due_date && l.status === "active") lines.push(`กรุณาชำระให้ครบภายใน ${fmtDate(l.due_date)}`);
+  return lines.join("\n");
+}
+
+async function openLayDetail(id) {
+  const l = state.layaways.find(x => x.id === id); if (!l) return;
+  const s = shirtOf(l.shirt_id) || {};
+  const ph = (s.photos || [])[0]; if (ph) await ensureUrls([ph]);
+  const paid = paidOf(l), remain = remainOf(l), pc = Math.min(100, paid / Math.max(1, n(l.total_price)) * 100);
+  const active = l.status === "active";
+  const m = openModal(`
+    <div class="modal-h"><h2>ผ่อน · ${esc(l.customer_name)}</h2><button class="x" type="button" aria-label="ปิด" id="yx">×</button></div>
+    <div class="modal-b">
+      <div class="lay-head">
+        <button type="button" class="lr-ph big" id="toShirt" title="ดูเสื้อ">${ph && photoUrl(ph) ? `<img src="${esc(photoUrl(ph))}" alt="">` : SHIRT_SVG}</button>
+        <div class="lay-meta">
+          <span class="st ${l.status} ${isOverdue(l) ? "late" : ""}">${isOverdue(l) ? "เกินกำหนด" : STATUS_TH[l.status]}</span>
+          <h2 class="name">${esc(s.code || "")} ${esc(s.name || "(ลบเสื้อแล้ว)")}</h2>
+          <p class="muted">${l.customer_contact ? esc(l.customer_contact) + " · " : ""}เริ่ม ${fmtDate(l.start_date)} · ${dueText(l)}</p>
+        </div>
+      </div>
+      <div class="lay-sum">
+        <div><span class="l">ราคาเต็ม</span><span class="v num">${baht(n(l.total_price))}</span></div>
+        <div><span class="l">จ่ายแล้ว</span><span class="v num gain">${baht(paid)}</span></div>
+        <div><span class="l">คงเหลือ</span><span class="v num ${remain > 0 ? "loss" : "gain"}">${baht(remain)}</span></div>
+      </div>
+      <span class="bar big"><i style="width:${pc.toFixed(1)}%"></i></span>
+      ${l.note ? `<p class="lay-note">${esc(l.note)}</p>` : ""}
+
+      ${active ? `<form class="paybox" id="payF">
+        <div class="field"><label for="pAmt">รับเงินงวดนี้ (฿)</label><input id="pAmt" type="number" min="1" inputmode="decimal" required placeholder="${remain}"></div>
+        <div class="field"><label for="pDate">วันที่รับ</label><input id="pDate" type="date" value="${today()}"></div>
+        <div class="field"><label for="pMethod">ช่องทาง</label><input id="pMethod" list="dlPay2" placeholder="โอน / เงินสด"></div>
+        <button class="btn orange" type="submit">+ บันทึกยอด</button>
+        <button class="linkbtn" type="button" id="payAll">รับยอดที่เหลือทั้งหมด ${baht(remain)}</button>
+      </form><datalist id="dlPay2"><option value="โอน"><option value="เงินสด"><option value="TrueMoney"><option value="PromptPay"></datalist>` : ""}
+
+      <h3 class="sub-h">ประวัติการจ่าย</h3>
+      ${l.payments.length ? `<div class="tbl-wrap"><table><thead><tr><th>#</th><th>วันที่</th><th>ประเภท</th><th>ช่องทาง</th><th class="r">ยอด</th>${active ? "<th></th>" : ""}</tr></thead><tbody>
+        ${l.payments.map((p, i) => `<tr><td class="num">${i + 1}</td><td>${fmtDate(p.paid_at)}</td><td>${p.kind === "deposit" ? "มัดจำ" : "ชำระ"}</td><td>${esc(p.method || "—")}</td><td class="r num">${baht(n(p.amount))}</td>${active ? `<td class="r"><button class="linkbtn danger-link" type="button" data-delpay="${esc(p.id)}">ลบ</button></td>` : ""}</tr>`).join("")}
+      </tbody></table></div>` : `<p class="empty">ยังไม่มีการจ่าย</p>`}
+      <div id="layZone"></div>
+    </div>
+    <div class="modal-f">
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn" type="button" id="copySum">คัดลอกสรุปยอดส่งลูกค้า</button>
+        ${active ? `<button class="btn" type="button" id="editLay">แก้ไข</button>` : ""}
+      </div>
+      ${active ? `<button class="btn danger" type="button" id="cancelLay">ยกเลิกการผ่อน</button>` : ""}
+    </div>`);
+  $("#yx", m).onclick = closeModal;
+  $("#toShirt", m).onclick = () => { if (s.id) { closeModal(); openDetail(s.id); } };
+  $("#copySum", m).onclick = async () => { try { await navigator.clipboard.writeText(laySummaryText(l)); toast("คัดลอกสรุปยอดแล้ว"); } catch (e) { toast("คัดลอกไม่สำเร็จ"); } };
+  if (!active) return;
+  $("#editLay", m).onclick = () => { closeModal(); openLayForm(s, l); };
+  $("#payAll", m).onclick = () => { $("#pAmt", m).value = remain; $("#pAmt", m).focus(); };
+  $("#payF", m).onsubmit = async e => {
+    e.preventDefault();
+    const amt = n($("#pAmt", m).value);
+    if (!(amt > 0)) { toast("ใส่ยอดเงินที่รับ"); return; }
+    if (amt > remain) { toast(`ยอดเกินที่ค้างอยู่ (${baht(remain)})`); return; }
+    const btn = e.submitter || $("#payF button[type=submit]", m); btn.disabled = true;
+    try {
+      const { error } = await sb.from("layaway_payments").insert({ layaway_id: l.id, kind: "payment", amount: amt, paid_at: $("#pDate", m).value || today(), method: $("#pMethod", m).value.trim() || null });
+      if (error) throw error;
+      await loadLayaways(false);
+      const done = await completeIfPaid(l.id);
+      if (!done) toast("บันทึกยอดแล้ว");
+      closeModal(); await render(); openLayDetail(l.id);
+    } catch (err) { btn.disabled = false; toast(dbErr(err)); }
+  };
+  m.querySelectorAll("[data-delpay]").forEach(b => b.onclick = () => {
+    $("#layZone", m).innerHTML = `<div class="confirm"><span>ลบยอดจ่ายรายการนี้?</span><button class="btn small danger" type="button" id="dpY">ลบ</button><button class="btn small" type="button" id="dpN">ไม่ลบ</button></div>`;
+    $("#dpN", m).onclick = () => { $("#layZone", m).innerHTML = ""; };
+    $("#dpY", m).onclick = async () => {
+      const { error } = await sb.from("layaway_payments").delete().eq("id", b.dataset.delpay);
+      if (error) return toast(dbErr(error));
+      await loadLayaways(false); closeModal(); await render(); openLayDetail(l.id);
+    };
+  });
+  $("#cancelLay", m).onclick = () => {
+    $("#layZone", m).innerHTML = `<div class="confirm"><span>ยกเลิกการผ่อนของ ${esc(l.customer_name)}? เสื้อจะกลับเข้าสต็อก (ประวัติการจ่าย ${baht(paid)} ยังเก็บไว้)</span><button class="btn small danger" type="button" id="clY">ยกเลิกการผ่อน</button><button class="btn small" type="button" id="clN">ไม่ใช่</button></div>`;
+    $("#clN", m).onclick = () => { $("#layZone", m).innerHTML = ""; };
+    $("#clY", m).onclick = async () => {
+      const { error } = await sb.from("layaways").update({ status: "cancelled", completed_at: today() }).eq("id", l.id);
+      if (error) return toast(dbErr(error));
+      await loadLayaways(false); closeModal(); await render(); toast("ยกเลิกการผ่อนแล้ว เสื้อกลับเข้าสต็อก");
+    };
   };
 }
 
